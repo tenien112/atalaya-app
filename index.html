@@ -97,13 +97,13 @@ footer{text-align:center;font-size:.85rem;color:var(--suave);padding:18px 0 26px
     <button class="btn" id="btnActualizar">Actualizar previsión</button>
     <button class="btn sec" id="btnInstalar" hidden>Instalar en el móvil</button>
   </div>
-  <p class="nota">Patera: embarcación tradicional, unas 20 h de travesía desde Argelia. Taxi: neumática con 3-4 motores a unos 30 nudos, unas 5 h, tolera más oleaje. La probabilidad de cada franja tiene en cuenta el mar que encontrarían durante toda la travesía hasta llegar a esa hora. Estimación orientativa basada en oleaje, viento y temporada; comprueba siempre los <a href="https://www.aemet.es/es/eltiempo/prediccion/maritima?opc1=0&opc2=martot&opc3=1&area=val1" target="_blank" rel="noopener">avisos de AEMET</a>.</p>
+  <p class="nota">Patera: embarcación tradicional, unas 20 h de travesía desde Argelia. Taxi: neumática con 3-4 motores a unos 30 nudos, unas 5 h, tolera más oleaje. La probabilidad de cada franja tiene en cuenta el mar que encontrarían durante toda la travesía hasta llegar a esa hora. Estimación orientativa, no oficial.</p>
 </main>
 <footer>ATALAYA by Lorenzo<br>© 2026 Lorenzo Moreno Villalba. Todos los derechos reservados.<br><span id="ver"></span></footer>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <script>
-const APP_VERSION = '2026.10.03-5';
+const APP_VERSION = '2026.10.03-8';
 
 /* ---------- Ruta Argelia - Cartagena (3 puntos) ---------- */
 const PUNTOS = [
@@ -138,22 +138,52 @@ const lin = (v,ok,max)=> v<=ok ? 1 : v>=max ? 0 : 1-(v-ok)/(max-ok);
 function color(p){ return p>65?'var(--alto)':p>=35?'var(--medio)':'var(--bajo)'; }
 
 /* ---------- Datos ---------- */
+const MOD_OLA = ['meteofrance_wave','ecmwf_wam025','ncep_gfswave025'];
+const MOD_VTO = ['ecmwf_ifs025','meteofrance_seamless','icon_seamless','gfs_seamless'];
+function mediaSerie(arr){ // media hora a hora ignorando huecos
+  const n=Math.max(...arr.map(a=>a.length)); const out=[];
+  for(let i=0;i<n;i++){ const v=arr.map(a=>a[i]).filter(x=>x!=null&&!isNaN(x)); out.push(v.length?v.reduce((p,q)=>p+q,0)/v.length:null); }
+  return out;
+}
+function mediaViento(vels,dirs){ // media vectorial de velocidad y dirección
+  const n=Math.max(...vels.map(a=>a.length)); const V=[],D=[];
+  for(let i=0;i<n;i++){ let x=0,y=0,s=0,k=0;
+    for(let m=0;m<vels.length;m++){ const v=vels[m][i], d=dirs[m][i]; if(v==null||d==null) continue;
+      const r=d*Math.PI/180; x+=v*Math.sin(r); y+=v*Math.cos(r); s+=v; k++; }
+    if(!k){V.push(null);D.push(null);continue;}
+    V.push(s/k); D.push((Math.atan2(x,y)*180/Math.PI+360)%360); }
+  return [V,D];
+}
+async function pedir(url){ const r=await fetch(url); if(!r.ok) throw new Error(r.status); const j=await r.json(); return Array.isArray(j)?j:[j]; }
 async function cargar(){
   $('estado').textContent='Cargando previsión…';
   const lat=PUNTOS.map(p=>p.lat).join(','), lon=PUNTOS.map(p=>p.lon).join(',');
   const comun=`latitude=${lat}&longitude=${lon}&past_days=1&forecast_days=7&timezone=Europe%2FMadrid`;
-  const [mar, vto] = await Promise.all([
-    fetch(`https://marine-api.open-meteo.com/v1/marine?${comun}&hourly=wave_height`).then(r=>{if(!r.ok)throw new Error('oleaje');return r.json();}),
-    fetch(`https://api.open-meteo.com/v1/forecast?${comun}&hourly=wind_speed_10m,wind_direction_10m&wind_speed_unit=kn`).then(r=>{if(!r.ok)throw new Error('viento');return r.json();})
-  ]);
-  const M = Array.isArray(mar)?mar:[mar], V = Array.isArray(vto)?vto:[vto];
-  const horas = M[0].hourly.time;
-  DATOS = {
-    horas,
-    ola: M.map(m=>m.hourly.wave_height),
-    vel: V.map(v=>v.hourly.wind_speed_10m),
-    dir: V.map(v=>v.hourly.wind_direction_10m)
-  };
+  const base='https://marine-api.open-meteo.com/v1/marine?'+comun+'&hourly=wave_height';
+  const baseV='https://api.open-meteo.com/v1/forecast?'+comun+'&hourly=wind_speed_10m,wind_direction_10m&wind_speed_unit=kn';
+  let M=null, V=null, nO=0, nV=0;
+  // oleaje: varios modelos
+  try{
+    const r=await pedir(base+'&models='+MOD_OLA.join(','));
+    const horas=r[0].hourly.time;
+    const ola=r.map(p=>{ const series=MOD_OLA.map(m=>p.hourly['wave_height_'+m]).filter(a=>a&&a.some(v=>v!=null)); nO=Math.max(nO,series.length); return series.length?mediaSerie(series):null; });
+    if(ola.every(Boolean)) M={horas,ola};
+  }catch(e){}
+  if(!M){ const r=await pedir(base); M={horas:r[0].hourly.time, ola:r.map(p=>p.hourly.wave_height)}; nO=1; }
+  // viento: varios modelos
+  try{
+    const r=await pedir(baseV+'&models='+MOD_VTO.join(','));
+    const vel=[],dir=[];
+    for(const p of r){ const vs=[],ds=[];
+      for(const m of MOD_VTO){ const a=p.hourly['wind_speed_10m_'+m], b=p.hourly['wind_direction_10m_'+m]; if(a&&b&&a.some(v=>v!=null)){vs.push(a);ds.push(b);} }
+      nV=Math.max(nV,vs.length); if(!vs.length) throw new Error('sin viento'); const [mv,md]=mediaViento(vs,ds); vel.push(mv); dir.push(md); }
+    V={horas:r[0].hourly.time, vel, dir};
+  }catch(e){}
+  if(!V){ const r=await pedir(baseV); V={horas:r[0].hourly.time, vel:r.map(p=>p.hourly.wind_speed_10m), dir:r.map(p=>p.hourly.wind_direction_10m)}; nV=1; }
+  // alinear viento con las horas del oleaje
+  const pos={}; V.horas.forEach((h,i)=>pos[h]=i);
+  const al=a=>M.horas.map(h=>pos[h]!=null?a[pos[h]]:null);
+  DATOS={ horas:M.horas, ola:M.ola, vel:V.vel.map(al), dir:V.dir.map(al), nO, nV };
   try{ localStorage.setItem('atalaya_datos', JSON.stringify({t:Date.now(), d:DATOS})); }catch(e){}
 }
 
@@ -269,7 +299,7 @@ async function iniciar(forzar){
     await cargar();
     calcular(); pintar();
     const ahora=new Date().toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit',timeZone:'Europe/Madrid'});
-    $('estado').textContent=`Previsión actualizada a las ${ahora}`;
+    $('estado').textContent=`Previsión actualizada a las ${ahora} · ${DATOS.nO} modelo${DATOS.nO>1?'s':''} de oleaje y ${DATOS.nV} de viento`;
     if(forzar) toast('Previsión actualizada');
   }catch(e){
     let c=null; try{ c=JSON.parse(localStorage.getItem('atalaya_datos')); }catch(_){}
